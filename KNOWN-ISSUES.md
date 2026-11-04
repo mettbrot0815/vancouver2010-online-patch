@@ -33,11 +33,19 @@ PDB, the stack words next to the fault resolve to XLLN's net-entity association 
 The `.data` pointer in the registers resolves to a namespace-scope `std::mutex`
 (`xlive_mutex_xnet_connect_status`, guarding the connect-status map).
 
-**Current hypothesis (not proven).** A `std::mutex::lock` that faults as a read of address 0 is
-the signature of a mutex whose internal pointer is null: locked before its constructor ran, or
-after its destructor ran. The net-entity containers themselves are not the suspect — every one
-of their access sites holds `xlln_critsec_network_net_entity`, and a `CRITICAL_SECTION` cannot
-produce a fault inside `MSVCP140.dll`.
+**Current hypothesis (not proven).** The address held in the registers is the DLL's **only**
+`std::mutex` (`xlive_mutex_xnet_connect_status`); the connect-status map it guards sits `0xCE4`
+bytes away, so the map is not the object being touched. `xlive.dll` imports `_Mtx_lock` and
+`_Mtx_unlock` but **not** `_Mtx_init`: the mutex is constructed by inlined VS2022 header code,
+while locking runs in whichever `msvcp140.dll` the PC has. The crashing PC reports
+`MSVCP140.dll 14.11.25325.0` — VS2017 RTM, older than the toolset that built the DLL — so the
+constructor and `_Mtx_lock` can disagree about the object's internal layout, which surfaces as a
+read of address 0 on the first lock. That first lock is the connect-status poll the title does
+immediately after accepting an invite, matching the ~2 s timing.
+
+First thing to try: install the current Visual C++ 2015-2022 Redistributable (x86) and confirm
+`msvcp140.dll` is `14.40` or newer. See
+[TROUBLESHOOTING #6](TROUBLESHOOTING.md#6-msvcp140dll-is-missing-vcruntime140dll-is-missing-d3dx9_38dll-is-missing).
 
 **Workaround.** Do not accept invites on the affected PC; join from the **lobby list** instead.
 The lobby must be freshly created — a stale invite cannot be accepted anyway.
