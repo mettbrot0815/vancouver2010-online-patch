@@ -1,0 +1,20 @@
+# build output and local noise
+build/
+bin/
+.vs/
+*.sln
+*.vcxproj*
+CMakeCache.txt
+CMakeFiles/
+
+# never commit player data or game data
+*.dmp
+*.log
+*.zip
+*.7z
+*.pak
+*.exe
+
+# installer backups and patch backups
+*.bak
+*.orig

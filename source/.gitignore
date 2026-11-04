@@ -1,0 +1,10 @@
+.cache/
+.vs/
+bin*
+build*
+CMakeCache.txt
+enc_temp_folder/
+lib/
+obj/
+xlivelessness/third-party/*/bin
+xlivelessness/xlive.aps

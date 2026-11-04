@@ -1,0 +1,13 @@
+upstream: https://gitlab.com/GlitchyScripts/xlivelessness.git
+head: 201d8f7730d8ab5d31aae92bc105bc96af07b175
+built: 2026-11-03 17:13:16
+
+recent commits:
+201d8f7 Advertise the real session port so peers can dial a fallback-bound host
+3f112fb Add opt-in xlln_title_bind_fallback for same-machine multi-instance title binds
+0c05156 Vancouver 2010 join fixes: XOnlineStartup guard, search verdict log format, title UDP port tracking, peer address handling, debug logging
+ee17e6d Fixed cmake to work with TitleBinary.props with and without a Visual Studio IDE generator. Updated Opus to v1.6.1. Force SSE and SSE2 support.
+2a7e422 fix(xlln): stop breaking into the debugger on log format failures and clock steps
+f0c8062 Fix(Overlay): Check if xinput1_4.dll or xinput1_3.dll have already been loaded instead of just loading whichever is available on system. Also FreeLibrary the xinput module when uninitialising.
+d89658e fix(xlive): queue XOVERLAPPED completion routines as APCs instead of calling them
+f5a696a fix(xnet): give every XNetCreateKey call a new key

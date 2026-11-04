@@ -1,0 +1,412 @@
+diff --git a/xlivelessness/xlive/live-over-lan.cpp b/xlivelessness/xlive/live-over-lan.cpp
+index 85ecd3e..b0624f0 100644
+--- a/xlivelessness/xlive/live-over-lan.cpp
++++ b/xlivelessness/xlive/live-over-lan.cpp
+@@ -28,6 +28,35 @@ CRITICAL_SECTION xlln_critsec_liveoverlan_sessions;
+ std::map<uint32_t, LIVE_SESSION_REMOTE*> liveoverlan_remote_sessions_xlocator;
+ // Key: InstanceId and session id.
+ std::map<LIVE_SESSION_REMOTE_KEY, LIVE_SESSION_REMOTE*> liveoverlan_remote_sessions_xsession;
++// Key: InstanceId. The session id the instance most recently advertised. A title stores the
++// session id it found a peer under and round-trips its stored peer address through
++// XNetXnAddrToInAddr and XNetInAddrToXnAddr before connecting; it abandons the join when the
++// session id that comes back is not the one it stored.
++static std::map<uint32_t, uint64_t> liveoverlan_instance_id_to_advertised_session_id;
++// Key: InstanceId. Network byte order, as advertised. The title port the peer's packets are
++// observed from can differ from the port it advertised, so the round trip needs the advertised one.
++static std::map<uint32_t, uint16_t> liveoverlan_instance_id_to_advertised_title_port;
++
++bool LiveOverLanGetInstanceAdvertisedSessionId(const uint32_t instance_id, XNKID* xnkid, uint16_t* title_port_network)
++{
++	if (!xnkid) {
++		return false;
++	}
++	
++	EnterCriticalSection(&xlln_critsec_liveoverlan_sessions);
++	const auto itrSessionId = liveoverlan_instance_id_to_advertised_session_id.find(instance_id);
++	if (itrSessionId == liveoverlan_instance_id_to_advertised_session_id.end()) {
++		LeaveCriticalSection(&xlln_critsec_liveoverlan_sessions);
++		return false;
++	}
++	memcpy(xnkid->ab, &itrSessionId->second, sizeof(XNKID));
++	if (title_port_network) {
++		const auto itrPort = liveoverlan_instance_id_to_advertised_title_port.find(instance_id);
++		*title_port_network = itrPort != liveoverlan_instance_id_to_advertised_title_port.end() ? itrPort->second : 0;
++	}
++	LeaveCriticalSection(&xlln_critsec_liveoverlan_sessions);
++	return true;
++}
+ 
+ // Wakes the advertise thread so a session change reaches peers before the next broadcast cycle.
+ void LiveOverLanAdvertiseNow()
+@@ -237,6 +266,10 @@ void LiveOverLanAddRemoteLiveSession(const uint8_t session_type, LIVE_SESSION* l
+ 	liveSessionRemote->liveSession = live_session;
+ 	
+ 	XllnNetEntityGetXnaddrXnkidByInstanceId(live_session->instanceId, &liveSessionRemote->xnAddr, 0);
++	
++	// Caller holds xlln_critsec_liveoverlan_sessions.
++	liveoverlan_instance_id_to_advertised_session_id[live_session->instanceId] = *(uint64_t*)&live_session->xnkid;
++	liveoverlan_instance_id_to_advertised_title_port[live_session->instanceId] = live_session->titlePortTcp;
+ 
+ 	// The advertised title port is the only place a peer learns where to dial the host's
+ 	// session listener. Without it the peer has no port to dial at all.
+@@ -708,12 +741,10 @@ bool LiveOverLanSerialiseLiveSessionIntoNetPacket(
+ 		if (live_session->sessionType == XLLN_LIVEOVERLAN_SESSION_TYPE_XSESSION) {
+ 			LIVE_SESSION &liveSessionSerialised = *(LIVE_SESSION*)&(((uint8_t*)*result_buffer)[sizeof(XllnNetworkPacket::TYPE)]);
+ 			{
+-				uint16_t portDial = XllnGetListeningTcpTitlePort_();
+-				if (!portDial) {
+-					// No TCP listener: the peer dials the game's UDP session socket, whose actual
+-					// port may differ from the requested system-link port (bind fallback).
+-					portDial = XllnGetBoundSystemLinkPortActual_();
+-				}
++				// The port the game really bound: a title may bind its session socket to an explicit
++				// port (observed: 59395) rather than taking the boot-time reservation, and a peer
++				// that dials the reservation reaches nothing.
++				const uint16_t portDial = XllnGetTitleDialPort_();
+ 				liveSessionSerialised.titlePortTcp = htons(portDial);
+ 			}
+ 			liveSessionSerialised.sessionFlags &= XLLN_LIVEOVERLAN_SESSION_FLAGS_MASK;
+diff --git a/xlivelessness/xlive/live-over-lan.hpp b/xlivelessness/xlive/live-over-lan.hpp
+index cf96509..767a28c 100644
+--- a/xlivelessness/xlive/live-over-lan.hpp
++++ b/xlivelessness/xlive/live-over-lan.hpp
+@@ -142,6 +142,9 @@ void LiveOverLanBroadcastLocalSessionUnadvertise(const XUID xuid);
+ void LiveOverLanBroadcastLocalXSessionUnadvertise(const XNKID xnkid);
+ void LiveOverLanBroadcastRemoteSessionUnadvertise(const uint32_t instance_id, const uint8_t session_type, const XUID xuid, const uint64_t session_id);
+ void LiveOverLanAddRemoteLiveSession(const uint8_t session_type, LIVE_SESSION* live_session);
++// The session id the instance last advertised, so a peer address round-trip answers with the id
++// the title stored rather than one derived from the instance id.
++bool LiveOverLanGetInstanceAdvertisedSessionId(const uint32_t instance_id, XNKID* xnkid, uint16_t* title_port_network = nullptr);
+ 
+ void XllnThreadLiveOverLanStart();
+ void XllnThreadLiveOverLanStop();
+diff --git a/xlivelessness/xlive/xnet.cpp b/xlivelessness/xlive/xnet.cpp
+index 8b2bede..45f0b04 100644
+--- a/xlivelessness/xlive/xnet.cpp
++++ b/xlivelessness/xlive/xnet.cpp
+@@ -10,6 +10,7 @@
+ #include "../xlln/debug-log.hpp"
+ #include "xsocket.hpp"
+ #include "xnetqos.hpp"
++#include "live-over-lan.hpp"
+ #include <WS2tcpip.h>
+ #include <iptypes.h>
+ 
+@@ -409,11 +410,23 @@ int32_t WINAPI XNetInAddrToXnAddr(const IN_ADDR in_addr, XNADDR* xnaddr, XNKID*
+ 		return E_FAIL;
+ 	}
+ 	
+-	XLLN_DEBUG_LOG(XLLN_LOG_CONTEXT_XLIVE | XLLN_LOG_LEVEL_DEBUG
+-		, "%s instanceId (0x%08x)."
+-		, __func__
+-		, instanceId
+-	);
++	// A title round-trips the peer address it stored through XNetXnAddrToInAddr and
++	// XNetInAddrToXnAddr before it connects, and abandons the join when the XNKID it stored is not
++	// the one that comes back. The XNKID it stored is the peer's advertised session id, not one
++	// derived from the instance id, so answer with the advertised id where it is known.
++	uint16_t advertisedTitlePort = 0;
++	if (xnkid) {
++		XNKID advertisedXnkid;
++		if (LiveOverLanGetInstanceAdvertisedSessionId(instanceId, &advertisedXnkid, &advertisedTitlePort)) {
++			*xnkid = advertisedXnkid;
++		}
++	}
++	// The port the game stored came from the advertise; packets observed from the peer can carry a
++	// different source port, so the round trip returns the advertised one.
++	if (xnaddr && advertisedTitlePort) {
++		xnaddr->wPortOnline = advertisedTitlePort;
++	}
++	
+ 	
+ 	return S_OK;
+ }
+@@ -728,10 +741,9 @@ uint32_t WINAPI XNetGetTitleXnAddr(XNADDR* xnaddr)
+ 	// A title that advertises its own XNADDR has to name a port a peer can dial, otherwise it
+ 	// publishes port 0 and the peer dials nothing.
+ 	if (xnaddr->wPortOnline == 0) {
+-		const uint16_t portTcp = XllnGetListeningTcpTitlePort_();
+-		if (portTcp) {
+-			xnaddr->wPortOnline = htons(portTcp);
+-		}
++		// The port the game really bound, not the boot-time reservation: a title that binds its
++		// session socket to an explicit port would otherwise publish a port nothing listens on.
++		xnaddr->wPortOnline = htons(XllnGetTitleDialPort_());
+ 	}
+ 	
+ 	uint32_t instanceId = ntohl(xnaddr->inaOnline.s_addr);
+diff --git a/xlivelessness/xlive/xsocket.cpp b/xlivelessness/xlive/xsocket.cpp
+index fc4a89f..c6d1de7 100644
+--- a/xlivelessness/xlive/xsocket.cpp
++++ b/xlivelessness/xlive/xsocket.cpp
+@@ -98,6 +98,48 @@ uint16_t XllnGetListeningUdpTitlePort_()
+ // The actual bound port of the datagram title socket the title pinned via XNetSetSystemLinkPort.
+ // With bind conflicts resolved to an ephemeral port this differs from xlive_port_system_link, and
+ // peers can only learn the real port from here.
++// The port of the most recently bound UDP title socket. Titles bind their auxiliary sockets (voice,
++// VDP) first and their session socket last, right before hosting, so the newest bind is the one a
++// peer must dial.
++static uint16_t xlln_title_port_udp_last_bound = 0;
++
++uint16_t XllnGetLastBoundUdpTitlePort_()
++{
++	return xlln_title_port_udp_last_bound;
++}
++
++// The UDP session port this instance reserves at boot (first XNetGetTitleXnAddr) and assigns to
++// the first UDP socket that requests port 0. Zero until reserved.
++static uint16_t xlln_title_session_port_reserved = 0;
++static bool xlln_title_session_port_claimed = false;
++
++uint16_t XllnReserveUdpSessionPort_()
++{
++	if (!xlln_title_session_port_reserved) {
++		const uint16_t base = 0xC000;
++		const uint16_t range = 0xFFFF - base;
++		xlln_title_session_port_reserved = base + (uint16_t)(xlln_global_instance_id % range);
++	}
++	return xlln_title_session_port_reserved;
++}
++
++uint16_t AssignUdpSessionPort_(const std::set<uint16_t> &takenPorts)
++{
++	const uint16_t reserved = XllnReserveUdpSessionPort_();
++	// The reservation is what the title cached at boot, so the first UDP port-0 claim takes it.
++	// A later claim (or a taken reservation) falls back to a random port that no socket holds.
++	if (!xlln_title_session_port_claimed && !takenPorts.count(reserved)) {
++		xlln_title_session_port_claimed = true;
++		return reserved;
++	}
++	const uint16_t base = 0xC000;
++	const uint16_t range = 0xFFFF - base;
++	uint16_t port;
++	do {
++		port = base + (rand() % range);
++	} while (takenPorts.count(port));
++	return port;
++}
+ uint16_t XllnGetBoundSystemLinkPortActual_()
+ {
+ 	uint16_t port = 0;
+@@ -118,6 +160,32 @@ uint16_t XllnGetBoundSystemLinkPortActual_()
+ 	return port;
+ }
+ 
++// The port a peer must dial to reach this instance's title. It has to be the port the game really
++// bound: a title may bind its session socket to a port of its own choosing (observed: 59395) while
++// a different socket holds the boot-time reservation, so publishing the reservation names a port
++// nothing listens on and the peer's join times out with no packet ever reaching this instance.
++uint16_t XllnGetTitleDialPort_()
++{
++	// Same order the advertise always used: a stream listener wins, then the socket the title bound
++	// for system-link traffic, then the newest UDP title socket (the session socket binds last).
++	const uint16_t portTcp = XllnGetListeningTcpTitlePort_();
++	if (portTcp) {
++		return portTcp;
++	}
++	const uint16_t portSystemLink = XllnGetBoundSystemLinkPortActual_();
++	if (portSystemLink) {
++		return portSystemLink;
++	}
++	const uint16_t portUdpLastBound = XllnGetLastBoundUdpTitlePort_();
++	if (portUdpLastBound) {
++		return portUdpLastBound;
++	}
++	// Nothing bound yet (boot-time XNADDR): name the reservation, which the first UDP port-0 bind
++	// takes. If the title instead binds an explicit port, every publish site re-reads this function
++	// and reports the real port from then on.
++	return XllnReserveUdpSessionPort_();
++}
++
+ bool SocketImplicitBind_(XLIVE_TITLE_SOCKET* title_socket)
+ {
+ 	if (!title_socket->hasBinded) {
+@@ -132,7 +200,10 @@ bool SocketImplicitBind_(XLIVE_TITLE_SOCKET* title_socket)
+ 		}
+ 		
+ 		title_socket->portRequested = 0;
+-		{
++		if (title_socket->protocol == IPPROTO_UDP) {
++			title_socket->portActual = AssignUdpSessionPort_(takenPorts);
++		}
++		else {
+ 			// generate an internally unused ephemeral port.
+ 			const uint16_t base = 0xC000;
+ 			const uint16_t range = 0xFFFF - base;
+@@ -144,6 +215,9 @@ bool SocketImplicitBind_(XLIVE_TITLE_SOCKET* title_socket)
+ 		xlive_title_socket_port_actual_to_title_socket[std::make_pair(title_socket->protocol == IPPROTO_TCP, title_socket->portActual)] = title_socket;
+ 		
+ 		title_socket->hasBinded = true;
++		if (title_socket->protocol == IPPROTO_UDP) {
++			xlln_title_port_udp_last_bound = title_socket->portActual;
++		}
+ 		
+ 		XLLN_DEBUG_LOG(XLLN_LOG_CONTEXT_XLIVE | XLLN_LOG_LEVEL_INFO
+ 			, "%s title_socket_handle (0x%zx) implicitly binded to port (%hu)."
+@@ -1319,12 +1393,17 @@ SOCKET WINAPI XSocketBind(SOCKET title_socket_handle, const sockaddr* name, int3
+ 		titleSocket->portRequested = portRequested;
+ 		titleSocket->portActual = portRequested;
+ 		if (titleSocket->portActual == 0 || portFellBack) {
+-			// generate an internally unused ephemeral port.
+-			const uint16_t base = 0xC000;
+-			const uint16_t range = 0xFFFF - base;
+-			do {
+-				titleSocket->portActual = base + (rand() % range);
+-			} while (takenPorts.count(titleSocket->portActual));
++			if (!bindingStream) {
++				titleSocket->portActual = AssignUdpSessionPort_(takenPorts);
++			}
++			else {
++				// generate an internally unused ephemeral port.
++				const uint16_t base = 0xC000;
++				const uint16_t range = 0xFFFF - base;
++				do {
++					titleSocket->portActual = base + (rand() % range);
++				} while (takenPorts.count(titleSocket->portActual));
++			}
+ 		}
+ 		
+ 		auto itrTspaToTs = xlive_title_socket_port_actual_to_title_socket.find(std::make_pair(bindingStream, titleSocket->portActual));
+@@ -1350,6 +1429,14 @@ SOCKET WINAPI XSocketBind(SOCKET title_socket_handle, const sockaddr* name, int3
+ 		
+ 		titleSocket->hasBinded = true;
+ 		
++		// Same record SocketImplicitBind_ keeps: the newest UDP title socket is the session socket
++		// (auxiliary sockets are bound first), and it is the port this instance has to publish. A
++		// title that binds an explicit port of its own (observed: 59395) never touches the
++		// reservation, so without this the published port is one no socket listens on.
++		if (!bindingStream) {
++			xlln_title_port_udp_last_bound = titleSocket->portActual;
++		}
++		
+ 		XllnWndSocketsInvalidateSockets();
+ 		
+ 		LeaveCriticalSection(&xlive_critsec_sockets);
+@@ -2599,6 +2686,8 @@ int32_t WINAPI XSocketSendTo(SOCKET title_socket_handle, const char* data_buffer
+ 	wsabuf.buf = (char*)data_buffer;
+ 	wsabuf.len = data_buffer_size;
+ 	uint32_t sent_size = 0;
++	{
++	}
+ 	int32_t resultXWsaRecvFrom = XWSASendTo(title_socket_handle, &wsabuf, 1, &sent_size, flags, address_to, address_to_size, 0, 0);
+ 	if (resultXWsaRecvFrom == ERROR_SUCCESS) {
+ 		return sent_size;
+diff --git a/xlivelessness/xlive/xsocket.hpp b/xlivelessness/xlive/xsocket.hpp
+index 14970dc..ea351cb 100644
+--- a/xlivelessness/xlive/xsocket.hpp
++++ b/xlivelessness/xlive/xsocket.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ #include <stdint.h>
+ #include <map>
++#include <set>
+ #include <vector>
+ #include <sys/timeb.h>
+ 
+@@ -331,5 +332,15 @@ XLIVE_TITLE_SOCKET* XllnGetTitleSocketByTitlePort_(bool is_stream, uint16_t titl
+ uint16_t XllnGetListeningTcpTitlePort_();
+ uint16_t XllnGetListeningUdpTitlePort_();
+ uint16_t XllnGetBoundSystemLinkPortActual_();
++// Reserves (once) the UDP port this instance publishes for its session. Every UDP session-port
++// assignment site must use this so the boot-time XNADDR port equals the port later bound.
++uint16_t XllnReserveUdpSessionPort_();
++// Picks the internal port for a UDP socket that requested port 0. Returns the reserved port.
++uint16_t AssignUdpSessionPort_(const std::set<uint16_t> &takenPorts);
++uint16_t XllnGetLastBoundUdpTitlePort_();
++// The port a peer must dial to reach this instance's title: the port the game actually bound
++// (stream listener, system-link socket, or newest UDP title socket), else the session reservation.
++// Every site that publishes a local XNADDR or advertise must use this, or peers dial a dead port.
++uint16_t XllnGetTitleDialPort_();
+ bool SocketImplicitBind_(XLIVE_TITLE_SOCKET* title_socket);
+ bool ShutdownTitleSocket_(XLIVE_TITLE_SOCKET* titleSocket, XTS_SHUTDOWN_STATE howTypeRequired);
+diff --git a/xlivelessness/xlive/xwsa.cpp b/xlivelessness/xlive/xwsa.cpp
+index 579fef5..2d6185a 100644
+--- a/xlivelessness/xlive/xwsa.cpp
++++ b/xlivelessness/xlive/xwsa.cpp
+@@ -1197,6 +1197,7 @@ int32_t WINAPI XWSASendTo(
+ 		);
+ 		WSASetLastError(WSAEFAULT);
+ 		return SOCKET_ERROR;
++	}	{
+ 	}
+ 	if (address_to && address_to->sa_family != AF_INET) {
+ 		XLLN_DEBUG_LOG(XLLN_LOG_CONTEXT_XLIVE | XLLN_LOG_LEVEL_ERROR
+@@ -1217,6 +1218,8 @@ int32_t WINAPI XWSASendTo(
+ 		WSASetLastError(ERROR_INVALID_HANDLE);
+ 		return SOCKET_ERROR;
+ 	}
++
++
+ 	
+ 	if (sent_size) {
+ 		*sent_size = 0;
+@@ -1475,6 +1478,7 @@ int32_t WINAPI XWSASendTo(
+ 		titleSocket->sendCompleted = false;
+ 		ResetEvent(titleSocket->sendNotify);
+ 		
++
+ 		if (instanceId == INADDR_LOOPBACK || instanceId == xlln_global_instance_id) {
+ 			SOCKET titleSocketHandleDestination = INVALID_SOCKET;
+ 
+diff --git a/xlivelessness/xlln/xlln-network.cpp b/xlivelessness/xlln/xlln-network.cpp
+index 533eb63..52a847e 100644
+--- a/xlivelessness/xlln/xlln-network.cpp
++++ b/xlivelessness/xlln/xlln-network.cpp
+@@ -20,6 +20,10 @@
+ #include <ctime>
+ #include <list>
+ 
++uint16_t XllnReserveUdpSessionPort_();
++
++uint16_t XllnGetTitleDialPort_();
++
+ uint16_t XllnGetListeningUdpTitlePort_();
+ 
+ static bool xlln_thread_shutdown = true;
+@@ -113,14 +117,24 @@ bool XllnNetEntityGetXnaddrXnkidByInstanceId(const uint32_t instanceId, XNADDR*
+ 		// listener is a valid fallback when the remote's port was never observed (its title
+ 		// traffic may not have reached us yet, or at all).
+ 		uint16_t remoteTitlePort = 0;
+-		EnterCriticalSection(&xlln_critsec_network_net_entity);
+-		auto itrNetEntityTitle = xlln_net_entity_instance_id_to_remote_address.find(instanceId);
+-		if (itrNetEntityTitle != xlln_net_entity_instance_id_to_remote_address.end()) {
+-			remoteTitlePort = itrNetEntityTitle->second.titlePortUdp;
++		if (instanceId != xlln_global_instance_id) {
++			EnterCriticalSection(&xlln_critsec_network_net_entity);
++			auto itrNetEntityTitle = xlln_net_entity_instance_id_to_remote_address.find(instanceId);
++			if (itrNetEntityTitle != xlln_net_entity_instance_id_to_remote_address.end()) {
++				remoteTitlePort = itrNetEntityTitle->second.titlePortUdp;
++			}
++			LeaveCriticalSection(&xlln_critsec_network_net_entity);
++			if (!remoteTitlePort) {
++				remoteTitlePort = xlln_title_port_udp_observed;
++			}
+ 		}
+-		LeaveCriticalSection(&xlln_critsec_network_net_entity);
+-		if (!remoteTitlePort) {
+-			remoteTitlePort = xlln_title_port_udp_observed;
++		else {
++			// Queries about THIS instance - e.g. a QOS response describing the local host - must
++			// carry the port a peer can really reach, i.e. the port the game bound. Nothing records
++			// the local instance in the remote-entity map, so without this the answer is port 0.
++			// The boot-time reservation is only the fallback: a title that binds its session socket
++			// to an explicit port would otherwise publish a port nothing listens on.
++			remoteTitlePort = XllnGetTitleDialPort_();
+ 		}
+ 		xnaddr->wPortOnline = htons(remoteTitlePort);
+ 	}
+@@ -2182,6 +2196,14 @@ static bool ParseNetworkData(uint8_t* data_buffer, size_t data_size, SOCKADDR_ST
+ 				XllnNetEntityUpdateRemoteAddress(packetFriendInvite.inviterInstanceId, sockaddr_external, packetName, via_hub);
+ 			}
+ 
++			// Record the host's advertised title port so the accept path can dial it. The advertise
++			// path does this in LiveOverLanAddRemoteLiveSession; the invite path never reached it.
++			if (liveSession->titlePortTcp) {
++				EnterCriticalSection(&xlln_critsec_network_net_entity);
++				xlln_net_entity_instance_id_to_remote_address[liveSession->instanceId].titlePortUdp = ntohs(liveSession->titlePortTcp);
++				LeaveCriticalSection(&xlln_critsec_network_net_entity);
++			}
++
+ 			uint32_t userIndex = XUSER_INDEX_NONE;
+ 			for (uint32_t iUser = 0; iUser < XLIVE_LOCAL_USER_COUNT; iUser++) {
+ 				if (xlive_local_users[iUser].signin_state != eXUserSigninState_NotSignedIn && xlive_local_users[iUser].xuid == packetFriendInvite.inviteeXuid) {
