@@ -39,7 +39,10 @@ hit them, [collect evidence](#if-it-breaks-collect-evidence-first) instead of re
 - **Vancouver 2010 PC**, retail install, version 1.0.0.1. The reference `Vancouver.exe` is
   8,320,328 bytes. If yours differs, this patch is not tested against it.
 - **Visual C++ 2015-2022 Redistributable (x86)** — provides `msvcp140.dll`, `vcruntime140.dll`.
-  A fresh Windows without it fails at launch with a missing-DLL dialog.
+  A fresh Windows without it fails at launch with a missing-DLL dialog. It must be **14.40 or
+  newer**: a leftover VS2017-era runtime (`14.11`, which a retail Vancouver 2010 install can bring
+  along) crashes this patch inside `msvcp140.dll` the first time a mutex is locked. Check with
+  `(Get-Item "$env:SystemRoot\SysWOW64\msvcp140.dll").VersionInfo.FileVersion`.
 - **DirectX End-User Runtime (June 2010)** — provides `d3dx9_38.dll`, needed by this 2009 title.
 - **Radmin VPN** (free, <https://www.radmin-vpn.com/>) for play over the internet. ZeroTier or
   Tailscale work too; XLLN broadcasts on every eligible adapter.

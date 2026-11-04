@@ -143,6 +143,24 @@ Get-Item "$env:SystemRoot\SysWOW64\msvcp140.dll","$env:SystemRoot\SysWOW64\vcrun
 Three files must exist. We do not ship these DLLs; they are Microsoft redistributables and must
 come from Microsoft.
 
+**A file existing is not enough — the version matters.** `xlive.dll` is built with the VS2022
+toolset. `std::mutex` *construction* is inlined into it, while `_Mtx_lock` and `_Mtx_unlock` are
+imported from whichever `msvcp140.dll` the PC has installed. An old runtime therefore mixes two
+generations of the same object layout: the constructor writes what the VS2022 headers describe,
+the lock reads what the old runtime expects. The visible result is a crash inside `msvcp140.dll`
+reading address `0x0` the first time a mutex is taken — for this patch, the first connect-status
+poll right after joining a session or accepting an invite.
+
+A retail Vancouver 2010 install can leave a VS2017-era runtime behind (`14.11.x`). Check the
+version, not just the file:
+
+```powershell
+(Get-Item "$env:SystemRoot\SysWOW64\msvcp140.dll").VersionInfo.FileVersion
+```
+
+Anything below `14.40` should be upgraded by installing the x86 redistributable above; it updates
+the installed runtime in place. `tools\collect-crash-run.ps1` prints this version and hash.
+
 ---
 
 ## 7. Game will not start at all, or starts and closes immediately
